@@ -41,6 +41,31 @@ from .sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
 
+_INDEX_CACHE_SCALE_BYTES = 4
+_INDEX_CACHE_ALIGNMENT_BYTES = 16
+
+
+def _mla_kv_cache_dim(hf_config) -> int:
+    """Return the packed MLA latent width (compressed KV plus RoPE lane)."""
+    return int(hf_config.kv_lora_rank) + int(hf_config.qk_rope_head_dim)
+
+
+def _aligned_index_cache_dim(index_head_dim: int) -> int:
+    """Return bytes per packed FP8 index-key row.
+
+    AITER stores ``index_head_dim`` FP8 key bytes followed by one inline FP32
+    scale (4 bytes) in a byte tensor. The row is padded to 16 bytes because the
+    sparse gather/Inductor path requires aligned row strides. Changing the
+    scale dtype requires a coordinated AITER kernel ABI change.
+    """
+    packed_bytes = int(index_head_dim) + _INDEX_CACHE_SCALE_BYTES
+    return (
+        (packed_bytes + _INDEX_CACHE_ALIGNMENT_BYTES - 1)
+        // _INDEX_CACHE_ALIGNMENT_BYTES
+        * _INDEX_CACHE_ALIGNMENT_BYTES
+    )
+
+
 # `max_split_per_batch` is only needed (and only exists in newer aiter builds)
 # for the segmented page_size>1 MLA path. Detect support once so the default
 # page_size=1 path never passes an unsupported kwarg.
@@ -77,8 +102,10 @@ def _global_index_cache_layer_ids(
         target_layer_ids = (
             layer_id
             for layer_id in target_layer_ids
-            if layer_id >= len(indexer_types) # mtp layers are not included in indexer_types
-            or indexer_types[layer_id] != "shared" # TODO(mengqing): will other models use keys don't named as shared?
+            # MTP layers are not included in indexer_types. Only the GLM
+            # "shared" value means no indexer module/cache owner; DeepSeek's
+            # index_topk_pattern "S" has different semantics and keeps a cache.
+            if layer_id >= len(indexer_types) or indexer_types[layer_id] != "shared"
         )
     return tuple(target_layer_ids) + tuple(
         range(num_hidden_layers, num_hidden_layers + num_draft_layers)
@@ -174,8 +201,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if spec_config is None or hasattr(runner, "eagle3_draft_builder"):
             return 0
         draft_hf_config = spec_config.draft_model_hf_config
-        # Mirror ModelRunner._get_total_num_layers(), which is authoritative for
-        # the rows actually allocated in this target MLA pool.
+        # Mirror ModelRunner._get_local_total_num_layers(), which is
+        # authoritative for rows actually allocated in the target MLA pool.
         return getattr(draft_hf_config, "num_nextn_predict_layers", 1)
 
     def _index_cache_layout(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -193,7 +220,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         )
         num_local_target_layers = end_layer - start_layer
         num_local_draft_layers = (
-            runner._get_total_num_layers() - num_local_target_layers
+            runner._get_local_total_num_layers() - num_local_target_layers
         )
         global_layer_ids = _global_index_cache_layer_ids(
             getattr(hf_config, "indexer_types", None),
@@ -876,9 +903,10 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         return result
 
     def sub_pool_specs(self) -> list[SubPoolSpec]:
-        """One paged KV pool. Per-block bytes = a single 576-dim packed
+        """One paged KV pool. Per-block bytes = a single packed
         tensor per layer (k_c + k_pe; V is absorbed into latent compression —
-        no separate V cache or kv_scale).
+        no separate V cache or kv_scale). Its width is 
+        ``kv_lora_rank + qk_rope_head_dim`` (k_c + k_pe)
 
         DeepSeek-V3.2 sparse variants add an indexer cache contribution
         for every indexer-owning layer, including draft/MTP layers. GLM-5.2
@@ -887,16 +915,15 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         config = runner.config
         hf_config = config.hf_config
-        total_num_layers = runner._get_total_num_layers()
+        total_num_layers = runner._get_local_total_num_layers()
         kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+        mla_cache_dim = _mla_kv_cache_dim(hf_config)
 
-        # TODO(Mengqing)： refactor the hard code of 576
-        block_bytes = total_num_layers * runner.block_size * 576 * kv_dtype_size
+        block_bytes = (
+            total_num_layers * runner.block_size * mla_cache_dim * kv_dtype_size
+        )
         if runner.is_deepseek_v32:
-            # TODO(Mengqing)： why we need +4 bytes for index_head_dim? is this used for the scale?
-            # and why we need to align to 16 bytes?
-            index_dim = hf_config.index_head_dim + 4
-            aligned_index_dim = ((index_dim + 15) // 16) * 16
+            aligned_index_dim = _aligned_index_cache_dim(hf_config.index_head_dim)
             index_cache_layer_ids, _ = self._index_cache_layout()
             block_bytes += (
                 len(index_cache_layer_ids)
@@ -909,8 +936,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
     ) -> dict:
-        """MLA: single 576-dim paged tensor per layer (k_c + k_pe packed,
-        no separate V cache — MLA absorbs V into the latent compression).
+        """MLA: one packed latent paged tensor per layer.
+
+        The last dimension is ``kv_lora_rank + qk_rope_head_dim`` (k_c + k_pe);
+        there is no separate V cache because MLA absorbs V into the latent
+        compression.
 
         DeepSeek-V3.2 sparse variants additionally allocate an `index_cache`
         for indexer-owning layers; the aligned dimension and compact layer map
@@ -919,26 +949,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         runner = self.model_runner
         config = runner.config
         hf_config = config.hf_config
-        total_num_layers = runner._get_total_num_layers()
-        # TODO(Mengqing): refactor the hard code of 576
+        total_num_layers = runner._get_local_total_num_layers()
+        mla_cache_dim = _mla_kv_cache_dim(hf_config)
         out: dict = {
             "kv_cache": torch.zeros(
                 total_num_layers,
                 runner.num_physical_kvcache_blocks,
                 runner.physical_block_size,
-                576,
+                mla_cache_dim,
                 dtype=dtypes.d_dtypes[config.kv_cache_dtype],
                 device="cuda",
             ),
         }
         if runner.is_deepseek_v32:
-            # Align last dimension to 16 bytes for fp8 (1 byte per element)
-            # to avoid unaligned memory access in torch inductor.
-            # TODO(Mengqing): refactor the hard code of 4, change to use
-            # different dtype for scale, and calculate the bytes by the
-            # exact dtype size
-            index_dim = hf_config.index_head_dim + 4
-            aligned = ((index_dim + 15) // 16) * 16
+            aligned = _aligned_index_cache_dim(hf_config.index_head_dim)
             index_cache_layer_ids, _ = self._index_cache_layout()
             out["aligned_index_dim"] = aligned
             out["index_cache_layer_ids"] = index_cache_layer_ids
@@ -961,9 +985,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind one MLA attention module to its KV slice.
 
-        Handles standard MLA (single 576-dim KV cache per layer) and the
+        Handles standard MLA (one packed latent KV cache per layer) and the
         DeepSeek-V3.2 sparse variant (additional indexer cache hooked via
-        `module.indexer.k_cache.kv_cache[0]`). Returns the KVCacheTensor or
+        ``module.indexer.k_cache.kv_cache[0]``). Returns the KVCacheTensor or
         None if the module is not an MLA attention this builder owns.
         Side effects: sets module `kv_cache`, `max_model_len`, and (V3.2)
         the indexer's k_cache slot.
@@ -978,10 +1002,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             return None
 
         runner = self.model_runner
+        mla_cache_dim = _mla_kv_cache_dim(runner.config.hf_config)
         kv_cache = runner.kv_cache[layer_id].view(
             runner.num_physical_kvcache_blocks * runner.physical_block_size,
             1,
-            576,
+            mla_cache_dim,
         )
         module.max_model_len = runner.config.max_model_len
         if runner.is_deepseek_v32 and module.indexer is not None:
@@ -1055,21 +1080,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         block_region_consumer_indices = None
         index_cache_layer_ids = getattr(runner, "index_cache_layer_ids", ())
         if index_cache_layer_ids:
-            local_index_layer_ids, global_index_layer_ids = (
-                self._index_cache_layout()
-            )
+            local_index_layer_ids, global_index_layer_ids = self._index_cache_layout()
             if tuple(index_cache_layer_ids) != local_index_layer_ids:
                 raise RuntimeError(
                     "Allocated and transfer-time index cache layouts disagree"
                 )
             num_hidden_layers = runner.config.hf_config.num_hidden_layers
             num_global_draft_layers = sum(
-                layer_id >= num_hidden_layers
-                for layer_id in global_index_layer_ids
+                layer_id >= num_hidden_layers for layer_id in global_index_layer_ids
             )
             num_global_kv_layers = num_hidden_layers + num_global_draft_layers
-            # TODO(Mengqing): better to rename this global_index_slots to global_index_layer_map
-            global_index_slots = {
+            # Unlike index_cache_layer_map (PP-local allocated rows), this map
+            # numbers compact index-cache rows in the consumer's global region
+            # list. It is used only to translate local P/D regions.
+            global_compact_index_slot_by_layer = {
                 global_layer_id: compact_layer_id
                 for compact_layer_id, global_layer_id in enumerate(
                     global_index_layer_ids
@@ -1099,7 +1123,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     f"draft={num_local_draft_layers}"
                 )
             block_region_consumer_indices = list(local_kv_layer_ids) + [
-                num_global_kv_layers + global_index_slots[layer_id]
+                num_global_kv_layers + global_compact_index_slot_by_layer[layer_id]
                 for layer_id in local_index_layer_ids
             ]
 
