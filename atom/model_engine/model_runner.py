@@ -610,6 +610,8 @@ class ModelRunner:
         self.block_size = config.kv_cache_block_size
         self.kv_cache_dtype = config.kv_cache_dtype
         self.enforce_eager = config.enforce_eager
+        # TODO(Mengqing): it seems more proper to name it as tp_world_size
+        # instead of world_size
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.world_size}"
@@ -1444,6 +1446,7 @@ class ModelRunner:
         return getattr(draft_hf, "num_nextn_predict_layers", 1)
 
     def _get_total_num_layers(self):
+        # TODO(Mengqing): it seems more proper to name it as _get_local_total_num_layers
         """Return total layer count including draft (MTP) layers.
 
         Drafts that own an independent KV cache via their own builder

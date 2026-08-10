@@ -53,6 +53,10 @@ class KVTransferTensors:
     slot_regions: list[KVTransferRegion]
     num_blocks: int
     num_slots: int = 0
+    # Optional producer-local -> consumer-global mapping for non-uniform block
+    # region layouts. Uniform per-layer groups leave this unset and use the
+    # connector's existing group-major inference.
+    block_region_consumer_indices: list[int] | None = None
     # The sliding window is a per-request ring, not part of the compressed
     # block_table, so it gets its own regions keyed by the request's state
     # slot. `unit_bytes` is one whole ring.
