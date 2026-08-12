@@ -58,6 +58,8 @@ class CoreManager:
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue[list[Sequence]]()
         self.utility_response_queue = queue.Queue()
+        # Latest load counters per DP rank, refreshed by the output threads.
+        self._engine_stats: dict[int, dict] = {}
         self._seq_id_to_callback = {}
         # Batched stream-flush hook, resolved lazily by the API server (avoids
         # an api_server <-> engine_core_mgr import cycle). Stays None on every
@@ -269,6 +271,7 @@ class CoreManager:
                     )
                     ready_received[dp_rank] = True
                     remaining -= 1
+                    poller.unregister(socket)
                 elif request_type == EngineCoreRequestType.SHUTDOWN:
                     raise RuntimeError(
                         f"{self.label}: Received unexpected SHUTDOWN signal from DP rank {dp_rank} during initialization"
@@ -363,6 +366,8 @@ class CoreManager:
                                     f"{self.label}: flush_stream_batch failed: {e}",
                                     exc_info=True,
                                 )
+                    elif request_type == EngineCoreRequestType.ENGINE_STATS:
+                        self._engine_stats[dp_rank] = data
                     elif request_type == EngineCoreRequestType.UTILITY_RESPONSE:
                         self.utility_response_queue.put_nowait(data)
                     elif request_type == EngineCoreRequestType.ADD:
@@ -761,8 +766,15 @@ class CoreManager:
         self._release_seq_load(req_id)
         try:
             self.broadcast_utility_command("abort_request", req_id=req_id)
-        except Exception as e:
+        except (OSError, RuntimeError) as e:
             logger.warning(f"{self.label}: abort_request({req_id}) failed: {e}")
+
+    def get_engine_stats(self) -> list[dict]:
+        """Most recent load counters from each DP rank that has reported.
+
+        Empty until the first publish arrives.
+        """
+        return list(self._engine_stats.values())
 
     def broadcast_utility_command(self, cmd: str, **kwargs):
         payload = {"cmd": cmd, **kwargs}

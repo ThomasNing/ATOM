@@ -338,6 +338,28 @@ class LLMEngine:
             },
         }
 
+    def get_engine_stats(self) -> dict[str, Any]:
+        """Return queue depths and KV-cache occupancy, summed across DP ranks."""
+        rank_stats = self.core_mgr.get_engine_stats()
+        if not rank_stats:
+            return {"enabled": False}
+
+        blocks_used = sum(int(s["kv_blocks_used"]) for s in rank_stats)
+        blocks_total = sum(int(s["kv_blocks_total"]) for s in rank_stats)
+        return {
+            "enabled": True,
+            "num_requests_running": sum(
+                int(s["num_requests_running"]) for s in rank_stats
+            ),
+            "num_requests_waiting": sum(
+                int(s["num_requests_waiting"]) for s in rank_stats
+            ),
+            "kv_blocks_used": blocks_used,
+            "kv_blocks_total": blocks_total,
+            "gpu_cache_usage_perc": blocks_used / blocks_total if blocks_total else 0.0,
+            "block_size": rank_stats[0]["block_size"],
+        }
+
     def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated prefix-cache statistics across DP ranks.
 

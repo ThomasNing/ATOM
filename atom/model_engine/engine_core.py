@@ -47,6 +47,8 @@ class EngineCore:
         self._is_rl_weights_offloaded = (
             False  # True when weights are offloaded for RL training
         )
+        # Last load snapshot published to CoreManager; see _publish_engine_stats.
+        self._last_stats_snapshot: tuple | None = None
         self.input_address = input_address
         self.output_address = output_address
         self.output_thread = threading.Thread(
@@ -227,6 +229,40 @@ class EngineCore:
             return True
         return False
 
+    def _publish_engine_stats(self):
+        """Push scheduler load counters onto the output queue when they change."""
+        # A disaggregated prefill scheduler has neither request counters nor a
+        # block manager; its KV blocks belong to the decode process.
+        block_manager = getattr(self.scheduler, "block_manager", None)
+        if block_manager is None or not hasattr(self.scheduler, "get_request_counts"):
+            return
+
+        num_running, num_waiting = self.scheduler.get_request_counts()
+        kv = block_manager.kv
+        total_blocks = kv.num_blocks
+        used_blocks = kv.num_used
+
+        snapshot = (num_running, num_waiting, used_blocks, total_blocks)
+        if snapshot == self._last_stats_snapshot:
+            return
+        self._last_stats_snapshot = snapshot
+
+        self.output_queue.put_nowait(
+            (
+                "ENGINE_STATS",
+                {
+                    "num_requests_running": num_running,
+                    "num_requests_waiting": num_waiting,
+                    "kv_blocks_used": used_blocks,
+                    "kv_blocks_total": total_blocks,
+                    "gpu_cache_usage_perc": (
+                        used_blocks / total_blocks if total_blocks else 0.0
+                    ),
+                    "block_size": self.scheduler.block_manager.block_size,
+                },
+            )
+        )
+
     def busy_loop(self):
         shutdown = False
         try:
@@ -239,6 +275,7 @@ class EngineCore:
                     continue
                 if not self.scheduler.is_finished():
                     self._process_engine_step()
+                self._publish_engine_stats()
         finally:
             # Teardown runs even on exceptions so the sender thread/socket
             # don't leak. Isolate the final publish so a publisher hiccup
@@ -436,6 +473,13 @@ class EngineCore:
                     socket.send(serialized_obj)
                     continue
 
+                if isinstance(item, tuple) and item[0] == "ENGINE_STATS":
+                    serialized_obj = pickle.dumps(
+                        (EngineCoreRequestType.ENGINE_STATS, item[1])
+                    )
+                    socket.send(serialized_obj)
+                    continue
+
                 # Regular finished sequences
                 seqs = item
                 valid_seqs = [
@@ -539,6 +583,7 @@ class DPEngineCoreProc(EngineCore):
                     self._execute_dummy_batch()
 
                 self.engines_running = global_has_unfinished
+                self._publish_engine_stats()
         finally:
             # Isolate the final publish so a publisher hiccup cannot skip
             # shutdown_kv_events() (which closes the sender thread/socket).

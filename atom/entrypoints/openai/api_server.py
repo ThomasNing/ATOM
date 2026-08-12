@@ -26,11 +26,11 @@ import uuid
 from asyncio import AbstractEventLoop
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer
 
@@ -169,7 +169,7 @@ def _build_sampling_params(
     )
 
 
-def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
+def _coerce_n(requested_n: int | None, temperature: float | None) -> int:
     """Return an effective ``n`` for a request.
 
     * ``None``/``<1`` coerce to ``1`` (matches OpenAI default).
@@ -183,8 +183,7 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
         n = int(n)
     except (TypeError, ValueError):
         n = 1
-    if n < 1:
-        n = 1
+    n = max(n, 1)
     if n > 1 and (temperature is None or temperature <= 0.0):
         logger.info(
             "n=%s requested with temperature=%s; collapsing to n=1 because "
@@ -199,7 +198,7 @@ def _coerce_n(requested_n: Optional[int], temperature: Optional[float]) -> int:
 def _validate_context_length(
     num_prompt_tokens: int,
     max_tokens: int,
-    max_model_len: Optional[int],
+    max_model_len: int | None,
 ) -> None:
     if max_model_len is None:
         return
@@ -262,13 +261,12 @@ def _load_image_from_url(url: str) -> Image.Image:
             image_bytes = response.read()
         return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    if url.startswith("file://"):
-        url = url[len("file://") :]
+    url = url.removeprefix("file://")
     return Image.open(url).convert("RGB")
 
 
 def _get_multimodal_processor():
-    global processor, model_name
+    global processor
     if processor is None:
         logger.info(f"Loading multimodal processor from {model_name}...")
         processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
@@ -809,7 +807,7 @@ async def generate_async_fanout(
     return outputs
 
 
-def validate_model(requested_model: Optional[str]) -> None:
+def validate_model(requested_model: str | None) -> None:
     """Validate that the requested model matches the server's model."""
     if requested_model is None:
         return
@@ -1558,14 +1556,14 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
             lambda: engine.config.max_model_len,
             lambda: engine.model_config.max_model_len,
             lambda: engine.scheduler.max_model_len,
-            lambda: getattr(engine, "max_model_len"),
+            lambda: engine.max_model_len,
         ):
             try:
                 _v = _path()
                 if _v:
                     max_ctx = int(_v)
                     break
-            except Exception:
+            except (AttributeError, TypeError, ValueError):
                 continue
         if not max_ctx:
             max_ctx = 30720
@@ -1817,6 +1815,60 @@ async def list_models():
 async def health():
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+def _escape_label_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics for KV-aware routers, autoscalers, and dashboards."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+
+    stats = engine.get_engine_stats()
+    if not stats.get("enabled"):
+        raise HTTPException(status_code=503, detail="Engine stats are not available")
+
+    model_label = f'{{model_name="{_escape_label_value(model_name)}"}}'
+    gauges = (
+        (
+            "atom:num_requests_running",
+            "Number of requests currently running on GPU.",
+            float(stats["num_requests_running"]),
+        ),
+        (
+            "atom:num_requests_waiting",
+            "Number of requests waiting to be processed.",
+            float(stats["num_requests_waiting"]),
+        ),
+        (
+            "atom:kv_cache_usage_perc",
+            "KV-cache usage. 1 means 100 percent usage.",
+            float(stats["gpu_cache_usage_perc"]),
+        ),
+    )
+
+    lines: list[str] = []
+    for name, help_text, value in gauges:
+        lines.append(f"# HELP {name} {help_text}")
+        lines.append(f"# TYPE {name} gauge")
+        lines.append(f"{name}{model_label} {value}")
+
+    config_label = (
+        f'{{block_size="{stats["block_size"]}",'
+        f'num_gpu_blocks="{stats["kv_blocks_total"]}",'
+        f'model_name="{_escape_label_value(model_name)}"}}'
+    )
+    lines.append("# HELP atom:cache_config_info KV-cache geometry of this engine.")
+    lines.append("# TYPE atom:cache_config_info gauge")
+    lines.append(f"atom:cache_config_info{config_label} 1.0")
+
+    return PlainTextResponse(
+        "\n".join(lines) + "\n",
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 @app.get("/debug/mtp_stats")

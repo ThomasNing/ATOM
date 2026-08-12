@@ -31,3 +31,5 @@ class EngineCoreRequestType(enum.Enum):
     READY = b"\x07"
     # Response to a synchronous utility command
     UTILITY_RESPONSE = b"\x08"
+    # Scheduler load counters, pushed by EngineCore when they change
+    ENGINE_STATS = b"\x09"

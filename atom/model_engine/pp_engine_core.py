@@ -63,6 +63,7 @@ class PPEngineCoreProc(EngineCore):
                     continue
                 if self._in_flight or not self.scheduler.is_finished():
                     self._pp_head_step()
+                self._publish_engine_stats()
         finally:
             try:
                 self.runner_mgr.call_func("flush_pp_send", wait_out=True)
