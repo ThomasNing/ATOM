@@ -905,7 +905,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def sub_pool_specs(self) -> list[SubPoolSpec]:
         """One paged KV pool. Per-block bytes = a single packed
         tensor per layer (k_c + k_pe; V is absorbed into latent compression —
-        no separate V cache or kv_scale). Its width is 
+        no separate V cache or kv_scale). Its width is
         ``kv_lora_rank + qk_rope_head_dim`` (k_c + k_pe)
 
         DeepSeek-V3.2 sparse variants add an indexer cache contribution
@@ -1009,6 +1009,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             mla_cache_dim,
         )
         module.max_model_len = runner.config.max_model_len
+        index_cache = None
         if runner.is_deepseek_v32 and module.indexer is not None:
             # `layer_id` is a PP-local cache-row counter, while the compact map
             # is keyed by global model layer IDs. On a non-first PP stage they
@@ -1021,18 +1022,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     f"cache layout: layer_num={global_layer_id}"
                 )
             index_cache_layer_id = runner.index_cache_layer_map[global_layer_id]
+            index_cache = runner.index_cache[index_cache_layer_id]
             # Use aligned dimension to avoid memory copy in torch inductor
-            module.indexer.k_cache.kv_cache[0] = runner.index_cache[
-                index_cache_layer_id
-            ].view(
+            module.indexer.k_cache.kv_cache[0] = index_cache.view(
                 runner.num_physical_kvcache_blocks * runner.physical_block_size,
                 1,
                 runner.aligned_index_dim,
             )
         module.kv_cache = kv_cache
-        index_cache = None
-        if runner.is_deepseek_v32 and hasattr(runner, "index_cache"):
-            index_cache = runner.index_cache[layer_id]
         return KVCacheTensor(
             layer_num=layer_id,
             k_cache=kv_cache,
