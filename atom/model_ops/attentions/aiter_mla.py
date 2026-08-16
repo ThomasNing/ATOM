@@ -37,34 +37,14 @@ from atom.utils.block_convert import (
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+from .mla_cache_layout import (
+    _aligned_index_cache_dim,
+    _global_index_cache_layer_ids,
+    _mla_kv_cache_dim,
+)
 from .sub_pool_spec import SubPoolSpec, page_pool
 
 logger = logging.getLogger("atom")
-
-_INDEX_CACHE_SCALE_BYTES = 4
-_INDEX_CACHE_ALIGNMENT_BYTES = 16
-
-
-def _mla_kv_cache_dim(hf_config) -> int:
-    """Return the packed MLA latent width (compressed KV plus RoPE lane)."""
-    return int(hf_config.kv_lora_rank) + int(hf_config.qk_rope_head_dim)
-
-
-def _aligned_index_cache_dim(index_head_dim: int) -> int:
-    """Return bytes per packed FP8 index-key row.
-
-    AITER stores ``index_head_dim`` FP8 key bytes followed by one inline FP32
-    scale (4 bytes) in a byte tensor. The row is padded to 16 bytes because the
-    sparse gather/Inductor path requires aligned row strides. Changing the
-    scale dtype requires a coordinated AITER kernel ABI change.
-    """
-    packed_bytes = int(index_head_dim) + _INDEX_CACHE_SCALE_BYTES
-    return (
-        (packed_bytes + _INDEX_CACHE_ALIGNMENT_BYTES - 1)
-        // _INDEX_CACHE_ALIGNMENT_BYTES
-        * _INDEX_CACHE_ALIGNMENT_BYTES
-    )
-
 
 # `max_split_per_batch` is only needed (and only exists in newer aiter builds)
 # for the segmented page_size>1 MLA path. Detect support once so the default
@@ -83,33 +63,6 @@ def _mla_seg_meta_kwargs() -> dict:
     if envs.ATOM_MLA_PAGE_SIZE > 1 and _MLA_META_SUPPORTS_MAX_SPLIT:
         return {"max_split_per_batch": 16}
     return {}
-
-
-def _global_index_cache_layer_ids(
-    indexer_types,
-    num_hidden_layers: int,
-    num_draft_layers: int,
-) -> tuple[int, ...]:
-    """Return global layers that own an index-key cache slice.
-
-    GLM-5.2 ``shared`` layers reuse a preceding full layer's temporary top-k
-    positions and do not construct an indexer, so their index-key cache slices
-    are dead. Other sparse MLA models have no ``indexer_types`` schedule and
-    retain the existing one-slice-per-layer layout.
-    """
-    target_layer_ids = range(num_hidden_layers)
-    if indexer_types is not None:
-        target_layer_ids = (
-            layer_id
-            for layer_id in target_layer_ids
-            # MTP layers are not included in indexer_types. Only the GLM
-            # "shared" value means no indexer module/cache owner; DeepSeek's
-            # index_topk_pattern "S" has different semantics and keeps a cache.
-            if layer_id >= len(indexer_types) or indexer_types[layer_id] != "shared"
-        )
-    return tuple(target_layer_ids) + tuple(
-        range(num_hidden_layers, num_hidden_layers + num_draft_layers)
-    )
 
 
 @dataclass
