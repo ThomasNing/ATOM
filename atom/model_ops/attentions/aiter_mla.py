@@ -148,15 +148,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         """Return draft layers in the target MLA pool across all PP stages."""
         runner = self.model_runner
         spec_config = getattr(runner.config, "speculative_config", None)
-        # Eagle3 draft layers are owned by eagle3_draft_builder and use a
-        # separate KV pool. Only MTP-style draft layers share the target MLA
-        # pool and therefore belong in this pool's global KV/index-cache layout.
+        # Eagle3 MHA drafts own a sibling pool via eagle3_draft_builder; they
+        # do not share this target MLA pool's layer rows or index-cache layout.
+        # Standalone DSpark MLA drafts (--draft-model) and serial MTP drafts
+        # both bind into the target pool and are counted by
+        # ModelRunner._num_draft_kv_layers().
         if spec_config is None or hasattr(runner, "eagle3_draft_builder"):
             return 0
-        draft_hf_config = spec_config.draft_model_hf_config
-        # Mirror ModelRunner._get_local_total_num_layers(), which is
-        # authoritative for rows actually allocated in the target MLA pool.
-        return getattr(draft_hf_config, "num_nextn_predict_layers", 1)
+        return runner._num_draft_kv_layers()
 
     def _index_cache_layout(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         """Return (local, global) global-layer IDs owning index cache slices."""
